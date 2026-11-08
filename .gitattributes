@@ -1,0 +1,8 @@
+# Every file here is shipped byte-for-byte.
+#
+# The .txt prompts carry a UTF-8 BOM and CRLF on purpose: Notepad on Windows renders
+# them correctly that way, and the prompts contain em dashes, a Chinese project name
+# and a redirected Documents path.  The .md prompts are LF.  `-text` disables git's
+# line-ending conversion for everything, so a clone gives back exactly these bytes.
+# Diffs still work normally.
+* -text

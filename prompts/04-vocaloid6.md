@@ -1,0 +1,194 @@
+# VOCALOID 6 — install an in-process bridge, and read this first
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running VOCALOID 6. It is written to stand alone.
+
+---
+
+## Goal
+
+Get a program **inside** a running VOCALOID 6, holding its own object graph, so it can
+read and (once calibrated) change the open song — with no clicking and no typing.
+
+**Why it has to be this way.** VOCALOID 6 has no scripting API, and unlike CeVIO its
+engine is not a managed library that can be referenced: the note model is native C++
+inside the editor process. So the bridge is a **DLL loaded into VOCALOID 6** that
+reaches that model from the inside and publishes MCP on loopback HTTP. It is not
+screen scraping and it does not use the keyboard or the mouse.
+
+## Read this before you plan anything
+
+Two measured facts change what is worth attempting here. Both come from injecting the
+bridge into a real VOCALOID 6 (`6.13.0.1`) and looking.
+
+1. **VOCALOID 6's editor is WPF on .NET, not a native C++ editor.** Its host image is
+   only `0x3d000` bytes, and its windows are `HwndWrapper[VOCALOID6;;...]` — the editor
+   is a shell over managed assemblies.
+2. **A note-map is a chain of raw pointers read from a module base, and the GC moves
+   managed objects.** So a chain that resolves today can go stale under you, and a
+   stale chain does not fail: it reads plausible garbage and writes it back.
+
+**Therefore: do not start a note-map discovery pass on VOCALOID 6 until someone has
+settled whether a stable chain exists at all.** VoiSona is JUCE and native and fits
+that workflow as written; VOCALOID 6 does not, yet. The bridge's own
+`capabilities.notes` will read `"none"` and that is the honest state, not a missing
+step.
+
+## Rules
+
+1. Do not modify, replace or delete any VOCALOID 6 file.
+2. Never kill the editor process.
+3. Never substitute UI automation, keystrokes or clipboard for a bridge capability.
+4. **Always eject before rebuilding.** Windows will not overwrite a DLL that is loaded.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository and dependencies
+
+```powershell
+git clone https://github.com/ppzbr/lh-vocaloid6-mcp
+cd lh-vocaloid6-mcp
+python -m pip install -e ".[mcp]"
+python -m pip install comtypes
+python -m pip install ziglang
+```
+
+* `comtypes` is what `lhai/live/uia.py` and `lhai/live/cevio_com.py` import, and it is
+  declared in the `[mcp]` extra above; the explicit line is a safety net for an older
+  checkout, where the UIA/COM tools cannot be imported without it.
+* `ziglang` provides `zig`, the only toolchain the native bridge needs.
+
+Start the MCP server (`lhai-mcp`, or `lhai-mcp http`). With no MCP client the same
+functions are importable: `from lhai.live import bridges, inject`.
+
+```
+live_status()
+```
+
+Confirms VOCALOID 6 is running, and reports its window and live channel.
+
+## Step 1 — build
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bridges/native/build.ps1
+```
+
+`bridges/native/lhai_bridge.cpp` builds `lhai_bridge.dll` (injected) and
+`lhai_bridge.exe` (the same server standalone, so the transport is testable with no
+editor involved). It writes `lhai_bridge.build-info.txt` beside them — that file is
+the build record, since this toolchain has no reproducible-output flag.
+
+The same DLL serves both VOCALOID 6 and VoiSona; tool names are prefixed with the
+engine id taken from the running editor's own file name, so one client drives both
+with no special cases.
+
+## Step 2 — prove the transport with no editor involved
+
+Run `lhai_bridge.exe`, then over HTTP:
+
+```
+initialize   -> serverInfo LhBridge, protocol 2024-11-05
+tools/list   -> 8 tools
+```
+
+So that a later failure is known to be the injection rather than the server.
+
+## Step 3 — inject
+
+```
+bridge_inject(engine="vocaloid")
+```
+
+```powershell
+python bridges/native/install.py vocaloid
+python bridges/native/install.py vocaloid --eject
+```
+
+No administrator rights are needed for the load; the editor must be running. Unload
+goes through the DLL's own `LhaiBridgeUnload` export, resolved from the on-disk PE and
+run with `CreateRemoteThread`, because a thread cannot free the module it is running in.
+
+## Step 4 — verify
+
+```
+bridge_list()
+bridge_status(engine="vocaloid")
+bridge_tools(engine="vocaloid")
+```
+
+and through `bridge_call(engine="vocaloid", tool=..., arguments=...)`:
+
+```
+vocaloid_modules   vocaloid_windows   vocaloid_scan   vocaloid_read
+vocaloid_write     vocaloid_chain     vocaloid_load_map   vocaloid_status
+```
+
+What a healthy injection looked like on the development machine (the shape is what
+matters, not the counts):
+
+```
+host image in the module list     255 modules
+scan "4D 5A"                      found at the image base
+chain u16 at the image base       0x5A4D  ("MZ")
+read at the image base            4d5a90000300000004000000ffff0000
+windows                           the editor's own HwndWrapper[...] windows
+status                            level: partial, capabilities.notes: "none"
+```
+
+The wrong-engine guard is deliberate: a VoiSona bridge asked for a `vocaloid_*` tool
+answers `ok: false, error: "tool <name> does not belong to engine unknown"`.
+
+`chain` resolves like a map file says: `p = base; for each offset o: p = *(void**)p +
+o`, then read `type` at `p`. Types: `u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 ptr utf8
+utf16 bytes`, with `count` for arrays.
+
+## Step 5 — what to use today instead of the note chain
+
+Two channels work now and do not depend on the unresolved question above.
+
+**A. The live layer, over UI Automation.** Run these before promising anything:
+
+```
+song_caps(engine="vocaloid")        # the authority: what can change, and through which channel
+song_map(engine="vocaloid")         # the control map in use: name -> automation id
+song_learn(engine="vocaloid")       # measure the toolbar once per editor version
+song_transport(engine="vocaloid", action="play")
+song_lyrics(engine="vocaloid", text="...")
+song_open(engine="vocaloid", path="song.vpr")
+song_save(engine="vocaloid")
+song_undo_redo(engine="vocaloid")
+song_snapshot(engine="vocaloid")
+```
+
+`song_learn` exists because some editors' control ids must be measured rather than
+guessed. `song_caps` is the authority on which channel can change what — **never
+describe a capability to a human before `song_caps` or `bridge_status` has reported it.**
+
+**B. The file route, which needs no running editor.**
+
+```
+engines()                                    # what this server knows, and each engine's channel
+project_import(path="song.vpr")               # .svp / .vsqx / .ccs / .mid also import
+project_create(name="song", bpm=120)
+notes_add(project="song", track="Vocals", notes=[{"start": 0, "duration": 1, "lyric": "la", "pitch": 60}])
+export(project="song", engines=["vocaloid"])  # write each engine's native format
+export_midi(project="song")
+open_in(project="song", engine="vocaloid")    # export, then launch the editor with it
+```
+
+For reading and writing an existing VOCALOID project, the file route is not a
+workaround — it is the stable one, and it is unaffected by anything the GC does.
+
+## Step 6 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| `bridge_inject` cannot find the process | VOCALOID 6 is not running, or runs under another name — check `live_status()` |
+| the DLL will not overwrite | it is loaded: `bridge_eject` first |
+| a chain read returns plausible nonsense | exactly the failure mode described at the top; do not build on it |
+| `capabilities.notes: "none"` | no note-map, and none is expected here yet |
+| `comtypes` ImportError | `python -m pip install comtypes` |
+
+Stop at the first unexplained failure and report it with the text you saw, the
+build-info hash, and the full `bridge_status` payload. Never restart or kill an editor
+holding unsaved work.

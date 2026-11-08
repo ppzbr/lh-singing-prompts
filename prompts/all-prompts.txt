@@ -1,0 +1,1595 @@
+﻿==============================================================================
+FILE: 01-synthesizer-v.txt
+==============================================================================
+
+# Synthesizer V — install and drive
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running Synthesizer V Studio. It is written to stand alone: the agent needs
+> this repository and nothing else explained to it.
+
+---
+
+## Goal
+
+Give a program — not a person — control of the **already open** project in
+Synthesizer V Studio: read the tracks, add and edit notes, set lyrics, pitch,
+phonemes and timing, and run the transport. Nothing may be clicked or typed to make
+that happen.
+
+**How it is done.** Synthesizer V is the only editor in this repository with a
+vendor scripting API: the host loads `.lua` scripts and hands them the `SV`,
+`Project` and `Editor` objects. So the bridge is a **resident Lua agent that the
+editor itself loads** — no DLL, no injection, no memory reading, no UI automation.
+
+**The one thing that cannot be automated.** A SynthV script has no programmatic
+entry point. The host runs one only from its *Scripts* menu. Writing the file is
+automated; the click that starts it is not. Ask the human for that click, once per
+generation per install.
+
+## Rules
+
+1. Touch nothing outside this repository except the agent file written into the
+   editor's own script folder.
+2. Never kill the editor process.
+3. Never substitute UI automation, keystrokes or clipboard for the one menu click.
+4. If a step fails, stop at that step and report exactly what happened.
+5. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository
+
+```powershell
+git clone https://github.com/ppzbr/lh-synthv-mcp
+cd lh-synthv-mcp
+```
+
+Every command below runs from the repository root.
+
+## Step 1 — dependencies
+
+```powershell
+python -m pip install -e ".[mcp]"
+python -m pip install comtypes
+```
+
+* `.[mcp]` brings the `mcp` transport and `comtypes` and nothing heavier: the client
+  is stdlib at import time, on purpose, so this installs on a bare Python.
+* `comtypes` is what `lhai/live/uia.py` and `lhai/live/cevio_com.py` import, and it is
+  declared in the `[mcp]` extra, so the line above is enough. On a checkout older than
+  that declaration, install it by hand: `python -m pip install comtypes`.
+
+Start the MCP server (`lhai-mcp` for stdio, `lhai-mcp http` for streamable HTTP) and
+call the tools below from your client. If you have no MCP client: the same functions
+are plain Python, `from lhai.live import synthv_live`, and every `foo()` named here
+is `synthv_live.foo()`.
+
+## Step 2 — see what the code sees
+
+```
+synthv_live_status()
+```
+
+Read it before writing anything.
+
+| field | meaning |
+|---|---|
+| `editions[]` | one row per generation found: `root`, `scripts`, `exe`, `data_location`, and **`roots`** — every candidate folder that was weighed, best first |
+| `editions[].root` | the folder the editor is **actually writing to**, chosen by which candidate holds the newest content |
+| `running_editions` | which generation is open right now |
+| `stale_path` | `true` when the installed agent is older than the template in this repository |
+
+Both generations are supported, and they are separate products with separate script
+folders, separate Lua hosts and separate processes: **Synthesizer V Studio 1.x** and
+**Synthesizer V Studio 2.x**. The installer writes into every generation it finds.
+
+Two traps, both hit for real:
+
+* **The registry is not the answer.** `HKCU\Software\Dreamtonics\Synthesizer V
+  Studio\DataLocation` is routinely stale — on the machine this was written on it
+  pointed at a folder nothing had written to in a month while the live folder was
+  elsewhere. The code gathers every candidate (`%APPDATA%`, the Documents folder *as
+  Windows defines it* — it is redirectable, and there it is `D:\文档` — and the
+  recorded `DataLocation`) and takes the newest. `roots` shows what lost.
+* **A 1.x path that is neither under `%APPDATA%` nor the recorded `DataLocation` is
+  correct, not a bug.** Do not "fix" it.
+
+## Step 3 — install the agent
+
+```
+synthv_live_install()
+```
+
+It writes the agent into each generation's live script folder, creates the IPC
+folder up front (Lua cannot create directories), and returns the paths, a `source`
+hash, whether an existing copy was `stale_path`, and a `next` string. **Hand `next`
+to the human verbatim** — it is step 4.
+
+## Step 4 — the human's one click, per running generation
+
+1. **Scripts → Rescan** — *only* if the agent was installed while the editor was
+   already running. The editor scans its script folder **once, at launch**, and does
+   not watch it: a file written afterwards is invisible until a rescan or a restart.
+2. **Scripts → Start Script → LHai Agent**.
+
+Then verify:
+
+```
+synthv_live_status()     # the agent now answers
+synthv_live_version()    # host identity, generation, editor version
+synthv_live_probe()      # which API calls this build answers, and how they were found
+```
+
+If an older copy is already running it cannot retire itself — the host stops the
+previous instance itself, and five measured starts produced five `# agent started`
+lines and zero `# agent retired` lines:
+
+> **Scripts → Stop all running scripts**, then start it once. That is the only
+> reliable way back to a known state.
+
+## Step 5 — drive it
+
+```
+synthv_live_state(group=1)                  # what the open project holds
+synthv_live_cmd(["VERSION", "TRACKS"])      # a batch of verbs, applied in order
+synthv_live_cmd([...], edition="sv1")       # choose a generation when both are open
+synthv_live_push(project="song.svp")        # push a project file's track into the editor
+```
+
+`synthv_live_cmd` takes a list of verbs — the agent's own command language. Each verb
+answers one line:
+
+```
+R <VERB> ok <payload>          or          R <VERB> err <reason>
+```
+
+| verb | does |
+|---|---|
+| `VERSION`, `PROBE` | identity, and which host calls this build answers |
+| `TRACKS`, `TRACKSEL` | list tracks / select one (`TRACKSEL` is handed the editor's own object, not an index) |
+| `GROUP` | group operations |
+| `NOTE`, `LYRIC`, `PITCH`, `PHONEME`, `TIMESHIFT`, `DEL` | note-level editing |
+| `STATE` | read the current track back |
+| `CLEAR` | clear the current track |
+| `SEEK`, `PLAY`, `STOP` | transport |
+| `UNDO`, `REDO`, `SAVE` | **absent from the vendor API** — see below |
+
+A batch is handed over as a file that the reader removes as it takes it, so no batch
+is ever applied twice. The reader takes its start offset from the result file's
+current size and never truncates it, so earlier batches stay readable.
+
+## Step 6 — what works, and what does not
+
+**Works:** everything note-level, plus transport, on both generations.
+
+**Does not, and refuses honestly:**
+
+* `UNDO`, `REDO`, `SAVE` — the host's own objects have no such entry point. This was
+  confirmed by enumerating the host's own member list, not assumed. The agent answers
+  `err`. Saving the project stays with the human or the editor.
+* Starting the script — see the one click above.
+* Updating a running agent by installing again. Rescan or restart.
+
+`PROBE` is the honest way to ask what a build supports: it merges the host's own
+member list with the names the vendor manual documents, and reports how many owners
+it enumerated. Enumeration is **tried, never required** — the older 1.x Lua engine
+may not answer `pairs()`, and `PROBE` still works.
+
+Never test for a method with `type(obj.name) == "function"`: this host binds methods
+as *callable userdata*, so that test reports "no" for every method that exists. Ask
+with `obj[name] ~= nil`, and let the call itself report failure.
+
+## Step 7 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| the menu has no `LHai Agent` | the folder written to is not the folder the editor scans — compare `editions[].root` with what the editor's own *Scripts* menu lists, and read `roots` |
+| every built-in appears twice in the menu | the script folder contains a nested copy; the scan is recursive — remove the duplicate, do not assume two installs |
+| installed, but never answers | the editor was already running when it was installed: rescan or restart |
+| answers with old behaviour | a stale agent from an earlier build is still running: **Stop all running scripts**, then start again |
+
+Stop at the first unexplained failure and report the text you saw. Do not restart or
+kill the editor to "fix" a step: an editor holding work is not yours to close.
+
+
+==============================================================================
+FILE: 02-cevio-ai.txt
+==============================================================================
+
+# CeVIO AI — install and drive the song engine
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running CeVIO AI. It is written to stand alone: it names every file it
+> needs, and the repository it starts from is the one that contains this file.
+
+---
+
+## Goal
+
+Give a program — not a person — control of CeVIO AI's **song** engine: singers,
+tempo, key, notes, lyrics, pitch, parameters, MusicXML in and out, and rendering.
+Nothing may be clicked or typed.
+
+**How it is done.** CeVIO AI's song engine publishes a managed class,
+`tssinger2.TSSingerCLI`, in `CeVIO.Song.dll` — the same class the editor uses to
+build a score and render audio. The bridge is a thin C# shim over that class plus an
+MCP server on loopback HTTP, **injected into the running editor**. It has to run
+inside CeVIO: the engine's static constructor throws `Authentication error.` in any
+process CeVIO has not licensed, which is why no standalone tool can exist.
+
+**What it does not do.** It does not patch, replace or modify any CeVIO file, it does
+not hook anything, and it never touches the open project.
+
+## Rules
+
+1. Do not modify anything inside the CeVIO AI install directory. Route A below writes
+   nothing there at all.
+2. Do not rebuild the bridge unless the existing one is missing or fails its build
+   check. A bridge built for the wrong runtime will not load, and the failure will not
+   explain itself.
+3. If a step fails, **stop at that step and report exactly what happened.** Do not
+   work around it, do not try a different runtime, do not edit the source.
+4. Never kill the editor to make a step succeed.
+5. Work only inside this repository. It is the CeVIO bridge and the client that
+   drives it; there is nothing else in it to touch.
+
+## Step 0 — the repository and dependencies
+
+```powershell
+git clone https://github.com/ppzbr/lh-cevio-mcp
+cd lh-cevio-mcp
+python -m pip install -e ".[mcp]"
+```
+
+`comtypes` is part of the `[mcp]` extra, because `lhai/live/cevio_com.py` and
+`lhai/live/uia.py` import it — one install is enough. Nothing else is needed to
+attach the bridge: the injection path is `ctypes` only.
+
+Start the MCP server (`lhai-mcp`, or `lhai-mcp http`) and call the tools below from
+your client. With no MCP client, the same functions are importable directly.
+
+## Step 1 — prove the checkout is intact
+
+```powershell
+python -m pytest
+```
+
+This runs offline, with no editor involved. Expected: every test passes. The suite
+includes an integrity check of this repository — `MANIFEST.txt` against every file,
+and the shipped `LhCeVioBridge.dll` against the sha256 in its build-info — so a pass
+means the binary you are about to install is the one that was built and recorded.
+If it fails, stop and report; do not reinstall or hand-edit a hash.
+
+## Step 2 — check the prerequisite
+
+```powershell
+Test-Path 'C:\Program Files\CeVIO\CeVIO AI\CeVIO.Song.dll'
+```
+
+If that is false, CeVIO AI is not installed where expected. Stop and report. Read the
+engine's own version and quote it in your report:
+
+```powershell
+[Reflection.AssemblyName]::GetAssemblyName('C:\Program Files\CeVIO\CeVIO AI\CeVIO.Song.dll').FullName
+```
+
+Expect something like `CeVIO.Song, Version=6.3.13.0`. The bridge was developed against
+`6.3.13.0`; a different version is not automatically a problem, but say so.
+
+## Step 3 — build the bridge
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bridges/cevio/build.ps1
+```
+
+This needs .NET Framework's `csc.exe`, which ships with Windows. It writes
+`LhCeVioBridge.dll` and `LhCeVioBridge.build-info.txt` into `bridges/cevio/`, and the
+same directory also holds `native/LhCeVioLoader.dll`. Expected tail:
+
+```
+built: LhCeVioBridge, ...
+sha256: <64 hex characters>
+bytes : ...
+wrote build-info.txt
+```
+
+If it fails, stop and report the compiler output verbatim. Rebuilding the native
+loader (which also happens here) needs `zig` on PATH or `pip install ziglang`; the
+repository already ships the loader it was verified with, so a failure there is not
+grounds for editing anything.
+
+## Step 4 — attach it
+
+**Route A — inject. No administrator rights, no restart, nothing written into
+`Program Files`.** CeVIO must already be running.
+
+```powershell
+python bridges/cevio/inject.py
+```
+
+This loads `bridges/cevio/native/LhCeVioLoader.dll` into the editor's own process; the
+loader reaches the CLR the editor already started and runs `LhCeVio.Bridge.Start` out
+of the bridge assembly by absolute path. If it prints `no endpoint appeared`, the
+loader's log says how far it got:
+
+```powershell
+Get-Content bridges/cevio/native/LhCeVioLoader.boot.txt
+```
+
+**Route B — the .NET start-up hook.** Use this only when CeVIO has to come up with the
+bridge already attached. It needs an **elevated** PowerShell, because it writes into
+the CeVIO AI directory.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bridges/cevio/install.ps1
+```
+
+The script verifies the bridge targets `net48` before copying it, copies the DLL and
+its build info into the CeVIO AI directory, writes `CeVIO AI (with bridge).cmd` and a
+Start Menu shortcut beside the shipped one (**the shipped shortcut is not modified**),
+then starts CeVIO through the new launcher and waits up to 45 s for the endpoint.
+
+The launcher starts the same executable your own shortcut starts — `CeVIO AI.exe` if
+it is there, otherwise a renamed `CeVIO AI.orig.exe`. That matters: an unlicensed
+process throws `Authentication error.` at the bridge, so the launcher must not start
+a different binary than the one you normally run.
+
+If it reports that the start-up hook did not run (no `boot.txt` at all), the
+`APPDOMAIN_MANAGER_*` variables did not reach the process. Report that; do not start
+editing the launcher.
+
+## Step 5 — confirm it worked
+
+Expected shape:
+
+```
+endpoint : http://127.0.0.1:431<nn>/mcp
+tools    : 21
+   cevio_bridge_status
+   cevio_project_info
+   ...
+```
+
+The port walks upward from 43102, so read it from the output rather than assuming it.
+If the endpoint came up but the tools are missing, read the diagnostics — they are
+written next to the bridge DLL, so the path depends on the route:
+
+```powershell
+# Route A
+Get-Content 'bridges/cevio/LhCeVioBridge.boot.txt'
+Get-Content 'bridges/cevio/LhCeVioBridge.status.json' -Raw
+# Route B
+Get-Content 'C:\Program Files\CeVIO\CeVIO AI\LhCeVioBridge.boot.txt'
+```
+
+One boot-log line is expected and is **not** a fault:
+
+```
+samplingFrequency query faulted: SEHException (0x80004005)
+```
+
+`TSSingerCLI.GetSamplingFrequency()` faults natively until a voice is loaded and
+answers normally after one is. The bridge therefore treats **a voice load** as its
+health check. The `engine walkthrough:` line is the one to read; on a healthy install
+it ends `... loadVoice=ok; getRate2=ok; ... setLanguages=ok`. `getRate` faulting
+alongside `getRate2=ok` is the same story as above. **Anything else on that line is a
+real failure** and should be reported verbatim — it names each call, so a break points
+at a call rather than at the engine as a whole. `cevio_engine` reports `uninitialised`
+rather than asking before a voice is loaded, deliberately: the same fault inside a tool
+call puts CeVIO's "Error Occurred" dialog on screen.
+
+## Step 6 — drive it
+
+Reach the bridge through the MCP client's bridge tools:
+
+```
+bridge_list()                       # every loopback bridge endpoint that is listening
+bridge_status()                     # identity, version, per-capability levels
+bridge_tools()                      # the 21 tool schemas, as the bridge publishes them
+bridge_call(name="cevio_project_info", args={})     # one call, one JSON answer
+```
+
+The song tools, all prefixed `cevio_`:
+
+```
+cevio_bridge_status   cevio_engine          cevio_list_singers    cevio_project_info
+cevio_set_voice       cevio_set_languages   cevio_set_key         cevio_set_tempo
+cevio_set_params      cevio_read_notes      cevio_add_notes       cevio_edit_notes
+cevio_delete_notes    cevio_clear_score     cevio_set_lyric       cevio_set_pitch
+cevio_import_musicxml cevio_export_musicxml cevio_synthesize      cevio_stop
+cevio_pipeline_probe
+```
+
+**Do not confuse these with the talk tools.** The MCP server also exposes
+`cevio_casts`, `cevio_say`, `cevio_wave`, `cevio_voice`, `cevio_state` and
+`cevio_phonemes`. Those drive CeVIO's **talk** half through its COM API and have
+nothing to do with singing. The singing half is only reachable through the injected
+bridge, with `bridge_call`.
+
+Read `cevio_bridge_status` / `cevio_engine` and trust the `capabilities` map they
+return; it is the bridge's own honest statement of what this build can do.
+
+## Step 7 — synthesis is refused by default, and that is deliberate
+
+`cevio_synthesize` **produces real audio** — one call on a freshly started CeVIO
+produced 96,000 frames of genuine 48 kHz mono, peak 32768, and the editor survived.
+
+It has also **killed the editor** with no chance to save:
+
+```
+System.NullReferenceException
+  <Module>.tssinger2.TSNotifier.Synthesized(tssinger2.TSNotifier*, std::vector<double>*)
+```
+
+Across four measured renders: a span plus one second on a fresh engine completed; a
+second render on that same engine produced 27,360 frames and then stalled; a fresh
+engine produced zero callbacks and stalled; and the render after a stall faulted
+outright. So a completed render is harmless, a **stalled** render poisons the engine,
+and the **next** render faults. A non-null notifier pointer predicts nothing — read on
+a cold singer it is already set — so the bridge cannot tell a working attempt from a
+fatal one in advance. That is why the tool refuses unless it is called with
+`force: true`.
+
+**Default behaviour: do not call `cevio_synthesize` with `force: true`.** Everything
+else — score construction, notes, lyrics, pitch, parameters, MusicXML, saving from the
+editor — works without rendering. Only attempt a forced render if the human asks for
+it, on a freshly started editor, and say in advance that the editor may die.
+
+## Step 8 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| `Authentication error.` | the engine is being touched from outside a licensed CeVIO process — the bridge must run *inside* the editor (Route A or B) |
+| `no endpoint appeared` | read `LhCeVioLoader.boot.txt`; report the last line |
+| endpoint up, no tools | read `LhCeVioBridge.boot.txt` and `LhCeVioBridge.status.json` |
+| the DLL will not be overwritten | a loaded bridge DLL cannot be replaced while CeVIO runs — ask the human to close CeVIO, or use Route A which loads from the repository and writes nothing into the install directory |
+| "Error Occurred at v9.1.14.0" | a tool call faulted in the engine's native layer — say which call preceded it and stop |
+
+If a step fails, stop and report. Never restart, or kill, an editor that holds
+unsaved work.
+
+
+==============================================================================
+FILE: 03-voisona.txt
+==============================================================================
+
+# VoiSona — install an in-process bridge and drive it
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running VoiSona. It is written to stand alone.
+
+---
+
+## Goal
+
+Get a program **inside** a running VoiSona, holding VoiSona's own object graph, so it
+can read and (once calibrated) change the open song. Nothing may be clicked or typed:
+not to install, not to drive.
+
+**Why it has to be this way.** VoiSona has no scripting API and no plugin API. Its
+note model is native C++ that exists only inside the running editor process. So the
+bridge is a **DLL loaded into VoiSona** that holds that model itself and publishes MCP
+on loopback HTTP. This is the same shape as an editor plugin that the vendor does not
+offer. It is not screen scraping and it does not use the keyboard or the mouse.
+
+**What it honestly is today.** The transport, the loader, the memory primitives and
+the MCP surface are built and measured. The **note vocabulary is not**: nothing
+hard-codes where VoiSona keeps its note list, because those offsets move whenever the
+editor updates, and a bridge with a stale offset does not fail — it reads plausible
+garbage and writes it back. `bridge_status` therefore reports
+`capabilities.notes: "none"` until a note-map has been learned. Read that field first
+and believe it.
+
+## Rules
+
+1. Do not modify, replace or delete any VoiSona file.
+2. Never kill the editor process. If it holds unsaved work, that is not yours to lose.
+3. Never substitute UI automation, keystrokes or clipboard for a bridge capability.
+4. **Always eject before rebuilding.** Windows will not overwrite a DLL that is loaded
+   in a running process.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository and dependencies
+
+```powershell
+git clone https://github.com/ppzbr/lh-voisona-mcp
+cd lh-voisona-mcp
+python -m pip install -e ".[mcp]"
+python -m pip install comtypes
+python -m pip install ziglang
+```
+
+* `.[mcp]` brings the `mcp` transport and `comtypes` and nothing heavier: the client
+  is stdlib at import time, on purpose, so the bridge is attachable on a machine that
+  has VoiSona and a bare Python.
+* `comtypes` is what `lhai/live/uia.py` and `lhai/live/cevio_com.py` import; it is
+  declared in the `[mcp]` extra above. The explicit line below is a safety net for an
+  older checkout, where the UIA/COM half of the tool set cannot import without it.
+* `ziglang` provides `zig`, the only toolchain the native bridge needs. It ships its
+  own clang, linker and Windows headers, and the resulting DLL depends only on system
+  DLLs, so nothing has to be installed on the target machine.
+
+Start the MCP server (`lhai-mcp`, or `lhai-mcp http`) and call the tools below from
+your client. With no MCP client the same functions are importable:
+`from lhai.live import bridges, inject`.
+
+Confirm VoiSona is actually running before anything else:
+
+```
+live_status()
+```
+
+It reports which of the four editors are running, their windows, and their live
+channels.
+
+## Step 1 — build the bridge
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bridges/native/build.ps1
+```
+
+One source file, `bridges/native/lhai_bridge.cpp`, builds two artifacts:
+
+| artifact | purpose |
+|---|---|
+| `lhai_bridge.dll` | injected into VoiSona; hosts MCP in-process |
+| `lhai_bridge.exe` | the same server standalone, so the transport can be tested without injecting into anybody's editor |
+
+It writes a build-info file beside them. Compare `bridges/native/lhai_bridge.build-info.txt`
+before and after a rebuild: `csc`-style determinism is not available here, so the
+build-info is the record. If the build fails, stop and report the compiler output.
+
+## Step 2 — prove the transport with no editor involved
+
+Run `lhai_bridge.exe` and drive it over HTTP:
+
+```
+initialize   -> serverInfo LhBridge, protocol 2024-11-05
+tools/list   -> 8 tools
+```
+
+This step exists so that a later failure is known to be the injection, not the server.
+
+## Step 3 — inject
+
+```
+bridge_inject(engine="voisona")
+```
+
+or, with no MCP client:
+
+```powershell
+python bridges/native/install.py voisona
+```
+
+The load is the ordinary `LoadLibraryW`-from-inside sequence in `lhai/live/inject.py`.
+No administrator rights are needed for the inject itself; the target must be running.
+
+To undo:
+
+```
+bridge_eject(engine="voisona")
+```
+
+```powershell
+python bridges/native/install.py voisona --eject
+```
+
+The unload is not symmetric in the obvious way: a thread cannot free the module it is
+running in, so the DLL publishes `LhaiBridgeUnload`, the client computes that export's
+remote address (module base + RVA, read from the on-disk PE) and runs it with
+`CreateRemoteThread`; the export schedules the real `FreeLibraryAndExitThread` on a
+fresh thread inside the target.
+
+## Step 4 — verify
+
+```
+bridge_list()                     # every bridge answering right now, and its engine
+bridge_status(engine="voisona")   # version, app baseline, per-capability levels
+bridge_tools(engine="voisona")    # the 8 tools with their real argument schemas
+```
+
+Then the primitives, all through `bridge_call(engine="voisona", tool=..., arguments=...)`:
+
+```
+voisona_modules   -> the loaded modules with base, size and path
+voisona_windows   -> this process's own top-level windows
+voisona_scan      -> signature scan with ?? wildcards, e.g. "4D 5A"
+voisona_read      -> raw bytes, by address or through a pointer chain
+voisona_write     -> patch bytes
+voisona_chain     -> module + RVA + pointer chain -> typed value
+voisona_load_map  -> bind a learned note vocabulary
+voisona_status    -> bridge version, engine identity, per-capability levels
+```
+
+A healthy injection reads back like this (the numbers are from the machine this
+bridge was developed on; the shape is what matters):
+
+```
+host image in the module list     17 modules in the standalone, 107 inside VoiSona
+scan "4D 5A"                      found at the image base
+chain u16 at the image base       0x5A4D  ("MZ")
+read at the image base            4d5a90000300000004000000ffff0000
+windows                           1 (the editor's own)
+status                            level: partial, capabilities.notes: "none"
+```
+
+The wrong-engine guard is deliberate: asking a VoiSona bridge for `vocaloid_*` answers
+`ok: false, error: "tool <name> does not belong to engine unknown"`. If you see that,
+you are talking to the wrong bridge or the host does not match its tools.
+
+`chain` resolves exactly as a map file states it: `p = base; for each offset o:
+p = *(void**)p + o`, then read `type` at `p`. Types: `u8 u16 u32 u64 i8 i16 i32 i64
+f32 f64 ptr utf8 utf16 bytes`, with `count` for arrays.
+
+## Step 5 — the note vocabulary is data, and learning it needs the human
+
+The vocabulary lives in a JSON note-map, learned once per **build** of the editor — not
+per editor. The offsets move on update, and a stale map is worse than no map: the
+bridge cannot tell a wrong offset from a right one, which is exactly why `load_map`
+takes the identity it was exported for.
+
+To learn one:
+
+1. `voisona_modules` for the base addresses.
+2. `voisona_scan` for a signature near the note structure — a lyric string adjacent to
+   a pitch and a duration is the usual anchor.
+3. `voisona_chain` to walk candidate chains from the module base to a value that
+   changes when **exactly one note is edited by hand in the editor**.
+4. Write the confirmed chains into a note-map JSON and call `voisona_load_map`.
+5. `voisona_status` should then read `capabilities.notes: "mapped"`.
+
+Step 3 cannot be automated away. A value that moves when a note moves is the only
+evidence a chain is right. So this step needs the human: ask them to change one note
+(then another, to be sure) while you diff memory. Confirm against the running editor,
+never against intuition.
+
+**A note-map is not a substitute for the note API you were hoping for.** It binds a
+vocabulary you describe; it does not give you an add-note/delete-note call the vendor
+never wrote. Say so before you start.
+
+## Step 6 — what to use today for note-level editing
+
+Until a note-map exists, put the bridge in its place: it is a **memory and transport
+instrument**, and the working channels for editing a song are these two.
+
+**A. The live layer, over UI Automation — no bridge needed.**
+
+```
+song_caps(engine="voisona")         # the authority on what can be changed, and through which channel
+song_map(engine="voisona")          # the control map in use: name -> automation id
+song_learn(engine="voisona")        # measure the toolbar and record which control is which
+song_transport(engine="voisona", action="play")
+song_lyrics(engine="voisona", text="...")     # fill the selected notes, clipboard-pasted
+song_open(engine="voisona", path="song.mid")
+song_save(engine="voisona")
+song_undo_redo(engine="voisona", redo=False)
+song_snapshot(engine="voisona")
+```
+
+`song_learn` exists because some editors' control ids have to be measured rather than
+guessed; run it once per editor version and the result is the map. `song_caps` is the
+authority — run it before promising anything to a human. **Do not describe a
+capability to the human before `song_caps` or `bridge_status` has reported it.**
+
+**B. The file route, which needs no running editor at all.**
+
+```
+engines()                                   # the engines this server knows, and their channels
+project_create(name="song", bpm=120)
+notes_add(project="song", track="Vocals", notes=[{"start": 0, "duration": 1, "lyric": "la", "pitch": 60}])
+lyrics_fill(project="song", track="Vocals", text="la la la")
+export(project="song", engines=["voisona"])  # write VoiSona's own format
+export_midi(project="song")                  # the one format every engine imports
+open_in(project="song", engine="voisona")    # export, then launch the editor with it
+```
+
+## Step 7 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| `bridge_inject` cannot find the process | VoiSona is not running, or it is running under a different name — check `live_status()` |
+| the DLL will not overwrite | it is loaded in the process: `bridge_eject` first |
+| the endpoint answers but the engine tools refuse | the guard in step 4 — the host does not match the tool prefix |
+| `capabilities.notes: "none"` and you expected edits | no note-map is loaded; that is the state, not a bug |
+| `comtypes` ImportError | `python -m pip install comtypes` |
+
+Stop at the first unexplained failure and report it with the text you saw, including
+the build-info hash and the `bridge_status` payload. Never restart or kill an editor
+that holds unsaved work; ask the human first.
+
+
+==============================================================================
+FILE: 04-vocaloid6.txt
+==============================================================================
+
+# VOCALOID 6 — install an in-process bridge, and read this first
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running VOCALOID 6. It is written to stand alone.
+
+---
+
+## Goal
+
+Get a program **inside** a running VOCALOID 6, holding its own object graph, so it can
+read and (once calibrated) change the open song — with no clicking and no typing.
+
+**Why it has to be this way.** VOCALOID 6 has no scripting API, and unlike CeVIO its
+engine is not a managed library that can be referenced: the note model is native C++
+inside the editor process. So the bridge is a **DLL loaded into VOCALOID 6** that
+reaches that model from the inside and publishes MCP on loopback HTTP. It is not
+screen scraping and it does not use the keyboard or the mouse.
+
+## Read this before you plan anything
+
+Two measured facts change what is worth attempting here. Both come from injecting the
+bridge into a real VOCALOID 6 (`6.13.0.1`) and looking.
+
+1. **VOCALOID 6's editor is WPF on .NET, not a native C++ editor.** Its host image is
+   only `0x3d000` bytes, and its windows are `HwndWrapper[VOCALOID6;;...]` — the editor
+   is a shell over managed assemblies.
+2. **A note-map is a chain of raw pointers read from a module base, and the GC moves
+   managed objects.** So a chain that resolves today can go stale under you, and a
+   stale chain does not fail: it reads plausible garbage and writes it back.
+
+**Therefore: do not start a note-map discovery pass on VOCALOID 6 until someone has
+settled whether a stable chain exists at all.** VoiSona is JUCE and native and fits
+that workflow as written; VOCALOID 6 does not, yet. The bridge's own
+`capabilities.notes` will read `"none"` and that is the honest state, not a missing
+step.
+
+## Rules
+
+1. Do not modify, replace or delete any VOCALOID 6 file.
+2. Never kill the editor process.
+3. Never substitute UI automation, keystrokes or clipboard for a bridge capability.
+4. **Always eject before rebuilding.** Windows will not overwrite a DLL that is loaded.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository and dependencies
+
+```powershell
+git clone https://github.com/ppzbr/lh-vocaloid6-mcp
+cd lh-vocaloid6-mcp
+python -m pip install -e ".[mcp]"
+python -m pip install comtypes
+python -m pip install ziglang
+```
+
+* `comtypes` is what `lhai/live/uia.py` and `lhai/live/cevio_com.py` import, and it is
+  declared in the `[mcp]` extra above; the explicit line is a safety net for an older
+  checkout, where the UIA/COM tools cannot be imported without it.
+* `ziglang` provides `zig`, the only toolchain the native bridge needs.
+
+Start the MCP server (`lhai-mcp`, or `lhai-mcp http`). With no MCP client the same
+functions are importable: `from lhai.live import bridges, inject`.
+
+```
+live_status()
+```
+
+Confirms VOCALOID 6 is running, and reports its window and live channel.
+
+## Step 1 — build
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bridges/native/build.ps1
+```
+
+`bridges/native/lhai_bridge.cpp` builds `lhai_bridge.dll` (injected) and
+`lhai_bridge.exe` (the same server standalone, so the transport is testable with no
+editor involved). It writes `lhai_bridge.build-info.txt` beside them — that file is
+the build record, since this toolchain has no reproducible-output flag.
+
+The same DLL serves both VOCALOID 6 and VoiSona; tool names are prefixed with the
+engine id taken from the running editor's own file name, so one client drives both
+with no special cases.
+
+## Step 2 — prove the transport with no editor involved
+
+Run `lhai_bridge.exe`, then over HTTP:
+
+```
+initialize   -> serverInfo LhBridge, protocol 2024-11-05
+tools/list   -> 8 tools
+```
+
+So that a later failure is known to be the injection rather than the server.
+
+## Step 3 — inject
+
+```
+bridge_inject(engine="vocaloid")
+```
+
+```powershell
+python bridges/native/install.py vocaloid
+python bridges/native/install.py vocaloid --eject
+```
+
+No administrator rights are needed for the load; the editor must be running. Unload
+goes through the DLL's own `LhaiBridgeUnload` export, resolved from the on-disk PE and
+run with `CreateRemoteThread`, because a thread cannot free the module it is running in.
+
+## Step 4 — verify
+
+```
+bridge_list()
+bridge_status(engine="vocaloid")
+bridge_tools(engine="vocaloid")
+```
+
+and through `bridge_call(engine="vocaloid", tool=..., arguments=...)`:
+
+```
+vocaloid_modules   vocaloid_windows   vocaloid_scan   vocaloid_read
+vocaloid_write     vocaloid_chain     vocaloid_load_map   vocaloid_status
+```
+
+What a healthy injection looked like on the development machine (the shape is what
+matters, not the counts):
+
+```
+host image in the module list     255 modules
+scan "4D 5A"                      found at the image base
+chain u16 at the image base       0x5A4D  ("MZ")
+read at the image base            4d5a90000300000004000000ffff0000
+windows                           the editor's own HwndWrapper[...] windows
+status                            level: partial, capabilities.notes: "none"
+```
+
+The wrong-engine guard is deliberate: a VoiSona bridge asked for a `vocaloid_*` tool
+answers `ok: false, error: "tool <name> does not belong to engine unknown"`.
+
+`chain` resolves like a map file says: `p = base; for each offset o: p = *(void**)p +
+o`, then read `type` at `p`. Types: `u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 ptr utf8
+utf16 bytes`, with `count` for arrays.
+
+## Step 5 — what to use today instead of the note chain
+
+Two channels work now and do not depend on the unresolved question above.
+
+**A. The live layer, over UI Automation.** Run these before promising anything:
+
+```
+song_caps(engine="vocaloid")        # the authority: what can change, and through which channel
+song_map(engine="vocaloid")         # the control map in use: name -> automation id
+song_learn(engine="vocaloid")       # measure the toolbar once per editor version
+song_transport(engine="vocaloid", action="play")
+song_lyrics(engine="vocaloid", text="...")
+song_open(engine="vocaloid", path="song.vpr")
+song_save(engine="vocaloid")
+song_undo_redo(engine="vocaloid")
+song_snapshot(engine="vocaloid")
+```
+
+`song_learn` exists because some editors' control ids must be measured rather than
+guessed. `song_caps` is the authority on which channel can change what — **never
+describe a capability to a human before `song_caps` or `bridge_status` has reported it.**
+
+**B. The file route, which needs no running editor.**
+
+```
+engines()                                    # what this server knows, and each engine's channel
+project_import(path="song.vpr")               # .svp / .vsqx / .ccs / .mid also import
+project_create(name="song", bpm=120)
+notes_add(project="song", track="Vocals", notes=[{"start": 0, "duration": 1, "lyric": "la", "pitch": 60}])
+export(project="song", engines=["vocaloid"])  # write each engine's native format
+export_midi(project="song")
+open_in(project="song", engine="vocaloid")    # export, then launch the editor with it
+```
+
+For reading and writing an existing VOCALOID project, the file route is not a
+workaround — it is the stable one, and it is unaffected by anything the GC does.
+
+## Step 6 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| `bridge_inject` cannot find the process | VOCALOID 6 is not running, or runs under another name — check `live_status()` |
+| the DLL will not overwrite | it is loaded: `bridge_eject` first |
+| a chain read returns plausible nonsense | exactly the failure mode described at the top; do not build on it |
+| `capabilities.notes: "none"` | no note-map, and none is expected here yet |
+| `comtypes` ImportError | `python -m pip install comtypes` |
+
+Stop at the first unexplained failure and report it with the text you saw, the
+build-info hash, and the full `bridge_status` payload. Never restart or kill an editor
+holding unsaved work.
+
+
+==============================================================================
+FILE: 05-piapro-studio-nt.txt
+==============================================================================
+
+# Piapro Studio NT — install the in-process runtime, and drive the project file
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running Piapro Studio NT. It is written to stand alone.
+
+---
+
+## What actually exists for this editor — read before promising anything
+
+Piapro Studio NT has **no vendor scripting API and no plugin API**, and this repository
+has **no MCP bridge** for it. Do not tell the human you are installing one.
+
+What does exist, and is what this prompt installs:
+
+| channel | what it gives you | state |
+|---|---|---|
+| **project file** — `.ppsf` | read and write the project, batch edit jobs, lyric romanisation, conversion to and from a dozen other editors' formats | built, round-trip tested |
+| **injected runtime** — a one-file drop-in shim | the eleven edit actions bound to hotkeys **inside** the running editor, plus autosave | built; same mechanism proven on six other editors |
+
+So: an AI can do everything to a Piapro project **as a file**, and can put a hotkey-bound
+action set **inside** Piapro. What it cannot do is edit the notes of the open project
+live, because nothing has been written that reaches Piapro's in-memory note model. Say
+that plainly rather than implying otherwise.
+
+Two measured facts that make the drop-in work here:
+
+* `Piapro Studio NT.exe` (x64, in `Standalone\`) **statically imports `WINMM.dll`** —
+  verified with a PE import walk, not assumed. `winmm` is not in the KnownDLLs list, so
+  Windows resolves that import from the **application directory first**: the shim placed
+  beside the exe is what gets loaded.
+* The engine, `Common\PPS3.dll` (65.6 MB), imports `WINMM.dll` too, and the exe links
+  `mscoree.dll` — it boots the .NET Framework CLR itself. That is why the CLR-hosting
+  loader is the right shape here, and the `hostfxr` shape is not needed.
+
+## Rules
+
+1. The only thing written outside this repository is one `winmm.dll` placed in the
+   editor's application directory. Delete it to uninstall. Nothing else, ever.
+2. Never modify, replace or delete a Piapro file. Never touch `PPS3.dll` or the data
+   folders (`Common\Data\plugins`, `settings`, `packages`, `phrases`).
+3. Never kill the editor process, and never let an action run against a project the
+   human has unsaved work in without them knowing.
+4. Every in-place action keeps a `.bak`; an action that changes nothing must not write.
+   Do not bypass that.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository and what to install
+
+```powershell
+git clone https://github.com/ppzbr/lh-piapro
+cd lh-piapro
+```
+
+Required: the **.NET SDK (8 or 10)**, and one C compiler for the native loader — `zig`
+(`python -m pip install ziglang`), MSVC, mingw-w64 or TinyCC; `build_loader.ps1`
+autodetects one. Nothing else.
+
+```powershell
+dotnet build VocalPatch\VocalPatch.slnx -c Release
+```
+
+## Step 1 — build the payload, the loader and the drop-in
+
+```powershell
+# the loader; also builds and loads a throwaway host to prove it works with no
+# editor involved, then drops the 64-bit loader into the payload folder
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\build_loader.ps1 -TestHost `
+    -Payload (Resolve-Path VocalPatch\src\VocalPatch.Editor\bin\Release\net472)
+
+# everything a user needs -> VocalPatch\dist\
+powershell -ExecutionPolicy Bypass -File VocalPatch\package.ps1
+```
+
+`VocalPatch\src\VocalPatch.Editor\bin\Release\net472\` is the complete, self-contained
+payload (`VocalPatch.Editor.dll`, `VocalPatch.Core.dll`, `0Harmony.dll`, `YamlDotNet.dll`,
+`System.Text.Json.dll` and its shims): that folder is exactly what the loader needs.
+`dist\` collects the loader (x64 and x86), the injector, the CLI, the payload and the
+drop-in shims.
+
+Do not skip `-TestHost`. It is the only step that proves the loader works **before** an
+editor is involved, and the loader appends every step to `%TEMP%\vocalpatch-loader.log`
+— read that log rather than guessing.
+
+## Step 2 — drive a project file (works with no editor at all)
+
+The CLI is `VocalPatch\dist\cli\vpatch.exe`:
+
+```powershell
+vpatch convert song.ustx song.ppsf        # -> Piapro's own format
+vpatch convert song.ppsf  song.vpr        # Piapro <-> VOCALOID4
+vpatch jobs                               # the job set
+
+vpatch job swing     song.ppsf out.ppsf --division 8 --amount 55
+vpatch job quantize  song.ppsf out.ppsf --grid 4 --strength 80
+vpatch pinyin song.ppsf song.pinyin.ppsf --split --tones marks
+vpatch harmony song.ppsf out.ppsf --interval thirdUp --root C --scale major
+vpatch autosave song.ppsf --interval 120 --snapshot
+```
+
+Formats that read and write: `ust`, `ustx`, `vsqx`, `vpr`, **`ppsf`**, `ccs`, `svp`,
+`midi`, `ufdata.json`, `commonnote.json`, `musicxml`, `lrc`, `srt`, `ass`,
+`vp.json`. So a song built anywhere can be handed to Piapro, and a Piapro project can be
+read, edited and sent anywhere else.
+
+`.ppsf` is VOCALOID4 XML — the same schema family as `.vsqx` and `.vpr`. Keep that in
+mind: Piapro is the only one of the editors in this repository whose project format is
+also a widely used interchange format.
+
+## Step 3 — the drop-in, so the actions exist inside the running editor
+
+Copy one file into the application directory:
+
+```powershell
+# C:\Program Files\... needs an elevated shell
+Copy-Item VocalPatch\dist\dropin\winmm.dll "C:\Program Files\Crypton\Piapro Studio NT\Standalone\"
+```
+
+`VocalPatch\native\deploy_dropin.ps1` can do it for you, but **its target table has the
+paths of the machine this was developed on hard-coded**. Use it to report
+(`-Apply` / `-Apply -Remove` to install/uninstall) only after checking the row for
+Piapro points at this machine's install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\deploy_dropin.ps1            # report only
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\deploy_dropin.ps1 -Apply
+```
+
+The shim does exactly one thing: `DllMain` starts a thread that loads
+`vocalpatch_loader.dll`, and **all 180 `winmm` exports are forwarded** to
+`System32\winmm.dll` so the editor's own audio behaviour cannot change. That forwarding
+is the reason a broken drop-in is the only thing that can be noticed, and it is why the
+shim is safe to leave in place.
+
+**Verify before trusting it:**
+
+```powershell
+# does this exe actually import winmm? (the drop-in is inert if it does not)
+powershell -ExecutionPolicy Bypass -File VocalPatch\dist\dropin\pe-imports.ps1 `
+    -Path "C:\Program Files\Crypton\Piapro Studio NT\Standalone\Piapro Studio NT.exe" -NamesOnly -Only WINMM.dll
+```
+
+Then start Piapro and read the two logs:
+
+```powershell
+Get-Content "$env:TEMP\vocalpatch-loader.log" -Tail 5     # last line must be: loader ok
+Get-Content "$env:TEMP\vocalpatch-editor.log" -Tail 20    # profile, watching, hotkey lines
+```
+
+Expected in the second log:
+
+```
+profile: Piapro Studio
+watching N folder(s)
+patched N save method(s)
+hotkey: Ctrl+Alt+V, Ctrl+Alt+S, Ctrl+Alt+Q, Ctrl+Alt+C, Ctrl+Alt+T, Ctrl+Alt+N,
+        Ctrl+Alt+P, Ctrl+Alt+H, Ctrl+Alt+L, Ctrl+Alt+E, Ctrl+Alt+Z
+```
+
+Read the `note:` line if it appears. On the development machine it read *"this host's
+own code is not in this AppDomain … the save hook cannot see its saves; the folder
+watcher and the hotkeys still work"* — so **do not promise that saving in Piapro
+triggers a snapshot.** The folder watcher and the hotkeys work regardless; the save
+hook depends on whether the host's own code shares the runtime this loader starts, and
+the log states which case you are in.
+
+The eleven actions, one hotkey each:
+
+| key | action |
+|---|---|
+| `Ctrl+Alt+V` | snapshot (timestamped copy into `.vocalpatch-autosave\`) |
+| `Ctrl+Alt+S` | swing |
+| `Ctrl+Alt+Q` | quantize |
+| `Ctrl+Alt+C` | staccato |
+| `Ctrl+Alt+T` | transpose |
+| `Ctrl+Alt+N` | normalize |
+| `Ctrl+Alt+P` | pinyin (romanise lyrics, keeping a `.bak`) |
+| `Ctrl+Alt+H` | harmony |
+| `Ctrl+Alt+L` | lyrics — **reads the clipboard**, one syllable per line: a hotkey cannot take typed input |
+| `Ctrl+Alt+E` | export every format into `vocalpatch-export\` |
+| `Ctrl+Alt+Z` | restore the `.bak` |
+
+Settings live in `vpatch-editor.ini` beside the payload: `profile=`, `autosave=`,
+`patchsaves=`, `snapshotinterval=`, `watch=<dir>` (several separated by `;`),
+`hotkey.<action>=`, `hotkeydebug=true`. Set `hotkeydebug=true` when a hotkey seems
+dead: a dead hook and a working one with nothing to do are otherwise
+indistinguishable. A chord acts only when the foreground window belongs to the injected
+process, and only then is it swallowed — with several editors injected, the others log
+`ignored (not the foreground editor)` and pass it on.
+
+**Watched folders** come from the profile
+(`{Documents}\Piapro Studio`, `{Documents}\VOCALOID4`) plus any `watch=` entries. If
+those directories do not exist, the user's Documents folder is used instead, so autosave
+still has somewhere to look — but it is looking in the wrong place. Projects living
+elsewhere need `watch=<dir>`.
+
+## Step 4 — the same actions on a file, no injection
+
+```powershell
+VocalPatch\dist\injector\vpatch-inject.exe actions
+VocalPatch\dist\injector\vpatch-inject.exe action song.ppsf swing
+VocalPatch\dist\injector\vpatch-inject.exe action song.ppsf export
+VocalPatch\dist\injector\vpatch-inject.exe autosave song.ppsf --interval 300
+```
+
+The CLI's `VocalPatch.Editor.EditorActions` and the runtime's hotkeys are the same entry
+point, so a hotkey press and a command line do exactly the same thing. Prefer this route
+when you do not need the editor open: it cannot disturb anybody's session.
+
+## Step 5 — what does not exist, and what to measure if you want it
+
+* **No live note editing.** Nothing reaches Piapro's in-memory note model. A hotkey
+  edits the project **file**. If the human asks you to add a note to the open project
+  without touching the file, the honest answer is no.
+* **No MCP bridge for Piapro.** The port has not been attempted, and nothing in this
+  repository implements one, so do not describe one.
+* **The vector for such a bridge is proven, though**: the drop-in loader already runs
+  managed code inside Piapro, and the payload is where a bridge would live. If the human
+  wants that built, say what is missing (a bridge assembly like the CeVIO one, plus the
+  endpoint) rather than inventing it.
+
+## Step 6 — portability, and the traps
+
+* The shim has a loader path baked in. On another machine it resolves in this order:
+  `VOCALPATCH_LOADER` environment variable → `loader=<path>` in a `vocalpatch.ini` beside
+  the shim → a `vocalpatch_loader.dll` beside the shim →
+  `%LOCALAPPDATA%\VocalPatch\payload\vocalpatch_loader.dll` →
+  `%ProgramData%\VocalPatch\payload\vocalpatch_loader.dll` → the baked path. Set
+  `VOCALPATCH_EDITOR_DIR` (where the runtime lives) too when the payload is not next to
+  the loader.
+* Loader and host bitness must match exactly, and so must the injector. This host is x64.
+* Repackaging while an editor is injected cannot overwrite a payload file that is mapped
+  into the running process: the old file is renamed `<name>.locked-<stamp>` and the new
+  one dropped in. Those leftovers can be deleted once the editor exits.
+* Writing into `C:\Program Files` needs an elevated shell. If you do not have one, stop
+  and ask the human — do not look for a way around it.
+
+## Step 7 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| no `vocalpatch-loader.log` at all | the editor never loaded the shim: check the PE import check in step 3, and that the file is in the **application** directory (beside the exe, not in `Common\`) |
+| loader log stops before `loader ok` | the payload path is wrong — set `VOCALPATCH_EDITOR_DIR`, or copy the payload next to the loader |
+| `%TEMP%\vocalpatch-editor.log` has no line for this pid | the loader ran but the runtime did not start; the loader log says why |
+| hotkeys do nothing | set `hotkeydebug=true` and try again — then read the log instead of guessing |
+| an action logs "nothing to do" | its input produced no change, and the runtime deliberately refuses to write in that case |
+
+Stop at the first unexplained failure and report the two logs verbatim. Never restart or
+kill an editor holding unsaved work.
+
+
+==============================================================================
+FILE: 06-x-studio.txt
+==============================================================================
+
+# X Studio (NetEase Cloud Music XStudio) — what works, what does not
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running X Studio. It is written to stand alone, and it starts with the truth:
+> **there is no live, in-process note control for X Studio.** Its project file is no
+> longer the obstacle, though — `.svip3` is Protocol Buffers, the schema was recovered from
+> the editor's own image, and a codec for the note layer now ships in `xstudio/`, checked
+> note for note against every template project the editor installs.
+
+---
+
+## Read this first
+
+X Studio here means **`NetEase Cloud Music XStudio.exe`** (the UI is XiaoIce's X Studio,
+shipped inside the NetEase Cloud Music wrapper). Measured on the machine this was
+written on: x64, 92 MB, a **Qt 6** application
+(`Qt6Core/Qt6Gui/Qt6Widgets/Qt6Multimedia/Qt6Sql/Qt6Network/Qt6Svg/Qt6Xml/Qt6Core5Compat`),
+with `msvcp140`/`vcruntime140`, `SoundTouch.dll`, a native `QNrbfFormat.dll`,
+`SharedRead.exe`/`SharedWrite.exe`, and an **x86** .NET Framework `NAudio.dll` that an
+x64 process cannot load — it is shipped but inert here.
+
+| what an AI wants | state for X Studio |
+|---|---|
+| read/write a project file | **works for the note layer** — the `.svip3` codec and an `svip3 convert` command live in `xstudio/` (step 0, step 4); it is not wired into the toolkit as cloned |
+| live note editing inside the editor | **does not exist** |
+| an MCP bridge into the process | **does not exist** |
+| the eleven edit actions inside the running editor, bound to hotkeys | the drop-in installs and the hotkeys exist, but as cloned they act on nothing: the profile's row is wrong and the codec is not loaded into the editor's process (step 3) |
+| autosave of project files while the editor runs | nothing, until the profile row is patched (step 3); then `auto_backup\` is covered and `watch=<dir>` covers the human's own folder |
+| making sound without the editor | **no**: the singing engine is a NetEase cloud gRPC service the editor is a client of — settled, with evidence, in step 4 leads; do not chase it |
+
+If the human asked for "AI control of X Studio", the correct answer is: *not yet* — and
+here is exactly what is missing and what to measure next. Do not install something and
+call it control.
+
+## Rules
+
+1. The only thing written outside this repository is one `winmm.dll` in the editor's
+   application directory. Delete it to uninstall.
+2. Never modify, replace or delete an X Studio file, and never touch
+   `%APPDATA%\XiaoIce\X Studio3\` — `db\xstudio_local.db`, `auto_backup\`, `Config\` and
+   `log_file\` are the editor's own, and it is running.
+3. Never kill the editor process.
+4. Do not claim a capability before the code that would implement it has been pointed at.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository, and the one thing that works today
+
+```powershell
+git clone https://github.com/ppzbr/lh-xstudio
+cd lh-xstudio
+```
+
+Build the X Studio codec first, because it is the only part of this page that works without
+editing anything:
+
+```powershell
+dotnet build xstudio\cli -c Release
+$svip3 = "xstudio\cli\bin\Release\net8.0\svip3.exe"
+& $svip3 info "$env:APPDATA\XiaoIce\X Studio3\auto_backup\*.svip3"
+```
+
+`xstudio/README.md` has the full story; `xstudio/xstudio-format.md` has the schema. Only after
+that does the drop-in runtime in `VocalPatch/` come into play, and it needs the **.NET SDK
+(8 or 10)** plus one C compiler for the loader — `zig` (`python -m pip install ziglang`),
+MSVC, mingw-w64 or TinyCC; `build_loader.ps1` autodetects one.
+
+```powershell
+dotnet build VocalPatch\VocalPatch.slnx -c Release
+
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\build_loader.ps1 -TestHost `
+    -Payload (Resolve-Path VocalPatch\src\VocalPatch.Editor\bin\Release\net472)
+
+powershell -ExecutionPolicy Bypass -File VocalPatch\package.ps1
+```
+
+Do not skip `-TestHost`: it is the only step that proves the loader works before any
+editor is involved. The loader writes every step to `%TEMP%\vocalpatch-loader.log`.
+
+## Step 1 — confirm the drop-in can even get in
+
+`NetEase Cloud Music XStudio.exe` **statically imports `WINMM.dll`** (verified with a PE
+import walk; `Qt6Multimedia.dll` does too). `winmm` is not in the KnownDLLs list, so
+Windows resolves that import from the **application directory first**:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File VocalPatch\dist\dropin\pe-imports.ps1 `
+    -Path "D:\NetEase Cloud Music XStudio\NetEase Cloud Music XStudio.exe" -NamesOnly -Only WINMM.dll
+```
+
+If that prints nothing, stop: the drop-in cannot load into this build, and nothing below
+applies.
+
+## Step 2 — install the drop-in
+
+```powershell
+Copy-Item VocalPatch\dist\dropin\winmm.dll "D:\NetEase Cloud Music XStudio\"
+```
+
+`VocalPatch\native\deploy_dropin.ps1` can do it (`-Apply` / `-Apply -Remove`), but **its
+target table hard-codes the development machine's paths** — check the `NetEase XStudio`
+row first, or just copy the file yourself. The shim forwards all 180 `winmm` exports to
+`System32\winmm.dll` and, in `DllMain`, starts a thread that loads
+`vocalpatch_loader.dll`; the editor's own audio behaviour cannot change.
+
+Start X Studio and read the logs:
+
+```powershell
+Get-Content "$env:TEMP\vocalpatch-loader.log" -Tail 5
+Get-Content "$env:TEMP\vocalpatch-editor.log" -Tail 20
+```
+
+What you should see, and what to do about each part:
+
+```
+profile: NetEase Cloud Music XStudio
+watching 1 folder(s)                      <-- and it is the wrong one; step 3
+patched N save method(s)
+hotkey: Ctrl+Alt+V, Ctrl+Alt+S, ...       <-- the hotkeys do exist
+```
+
+The chords are `Ctrl+Alt+V/S/Q/C/T/N/P/H/L/E/Z` (snapshot, swing, quantize, staccato,
+transpose, normalize, pinyin, harmony, lyrics, export, restore). Settings live in
+`vpatch-editor.ini` beside the payload: `profile=`, `autosave=`, `patchsaves=`,
+`snapshotinterval=`, `watch=<dir>`, `hotkey.<action>=`, `hotkeydebug=true`.
+`hotkeydebug=true` logs every key the hook sees — the only way to tell a dead hook from
+a working one with nothing to do.
+
+## Step 3 — the profile is wrong, and here is the row it should have
+
+This is a measured mismatch, not a guess. The `xstudio` row in
+`VocalPatch\src\VocalPatch.Editor\EditorProfile.cs` says:
+
+```
+id         xstudio
+process    "NetEase Cloud Music XStudio"     (prefix match, so …XStudio.exe does match)
+extensions .svip, .mid
+folders    {AppData}\SXSEditor, {Documents}\NetEase Cloud Music XStudio
+```
+
+The editor on disk says otherwise: its data root is `%APPDATA%\XiaoIce\X Studio3\`
+(`Config\setting.ini`, `db\xstudio_local.db`, `auto_backup\*.svip3`, `log_file\`,
+`template_projects\`) and its projects are **`.svip3`**. The watcher and every hotkey action
+filter by that extension list, so as cloned the runtime sees nothing at all. The corrected
+row:
+
+```csharp
+new EditorProfile("xstudio", "NetEase Cloud Music XStudio", "NetEase Cloud Music XStudio",
+    new[] { ".svip3" },
+    new[] { @"{AppData}\XiaoIce\X Studio3\auto_backup" }),
+```
+
+`auto_backup` is the folder that gains `.svip3` files while the editor runs, and the watcher
+recurses. `template_projects\` is left out on purpose: those never change, and copying 30 MB
+of them per cycle is noise.
+
+**Two further things it cannot know.** First, where the human saves their own projects: there
+is no project-path key in `Config\setting.ini`, and `db\xstudio_local.db` has a
+`xs_work_info_tb.path` column that stays empty until something is saved (measured: 0 rows on a
+machine that had only ever opened templates). Ask the human, or read the folder off a saved
+`.svip3`, then set `watch=<that folder>` in `vpatch-editor.ini` beside the payload — `watch=`
+adds a folder, it does not replace the profile's own. Until then the hotkeys act on the newest
+`.svip3` under `auto_backup\`: the editor's own autosave copy, not the project file the human
+saved. Say that out loud rather than letting someone believe a hotkey rewrote their project.
+
+Second, and more important: **patching the row is not enough for the hotkeys to work.** The
+actions edit a project through a codec, and the `.svip3` codec lives in this repository's
+`xstudio/` folder, loaded by nothing. Wiring it in is *not* the two lines it looks like —
+both of the obvious ones fail, and both were measured:
+
+* `VocalPatch.Core` is `netstandard2.0` and the codec is `net8.0`, so Core cannot reference
+  it. Adding `<ProjectReference Include="..\..\..\xstudio\src\VocalPatch.XStudio.csproj" />`
+  to `VocalPatch.Core.csproj` fails with **MSB4006: a circular dependency in the target
+  dependency graph** — the codec already references Core.
+* The runtime that executes the actions *inside the editor* is the payload's `net472`
+  target, and a `net472` assembly cannot load a `net8.0` one either.
+
+The shape that does work — compiled, not guessed — is three steps:
+
+```powershell
+# 1. retarget the codec so the in-editor runtime can use it (it compiles as-is)
+#    xstudio\src\VocalPatch.XStudio.csproj
+#      <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
+
+# 2. reference it from the project that hosts the actions, which already references Core,
+#    never from Core itself
+#    VocalPatch\src\VocalPatch.Editor\VocalPatch.Editor.csproj
+#      <ProjectReference Include="..\..\..\xstudio\src\VocalPatch.XStudio.csproj" />
+
+# 3. register it where the runtime starts, not in FormatRegistry's constructor
+#    FormatRegistry.Register(new Svip3Format());
+
+dotnet build VocalPatch\VocalPatch.slnx -c Release
+```
+
+Either do that, or use `xstudio`'s own `svip3` command and the file path instead of the
+hotkeys. Both are honest; claiming the hotkeys work without one of them is not.
+
+The actions go through `VocalPatch.Core`'s codecs, so once `.svip3` is registered and the row
+is patched, an action on an `.svip3` really does edit it, and autosave snapshots whatever the
+watcher finds into a `.vocalpatch-autosave\` folder next to it. What still does not exist is
+live, in-process control — the rest of this page is about what does.
+
+## Step 4 — the file format is identified: `.svip3` is Protocol Buffers
+
+This part is measured, not guessed, and it is what changed: `.svip3` was the last blind
+format in the toolkit's table, and it is now fully specified — in `xstudio/`, deliberately not
+in `VocalPatch.Core`.
+
+* **`.svip3` is a serialized `xstudio.proto.AppModel`.** The first bytes are already a
+  protobuf field — `0a 2f //Users/wey/Desktop/….svip3`, i.e. field 1, wire type 2,
+  length-delimited — and the image names its own schema in plain ASCII:
+  `type.googleapis.com/xstudio.proto.SingingTrack`, `xstudio.proto.Note.lyric`,
+  `xstudio.proto.SingingTrack.ai_singer_id`, `xstudio.proto.LineParamNode`, …
+* **The whole `.proto` is embedded in the exe.** A protobuf C++ build registers a
+  serialized `FileDescriptorProto`, and that message begins `0a <len> "<name>.proto"`.
+  Scanning the 92 MB image for that shape recovers nine descriptors — X Studio's own
+  `xstudio_model.proto` (the project), `xstudio_config.proto`,
+  `fastspeech_singing_v3.proto`, `fragment_feature_v3.proto`, plus the five
+  `google/protobuf` ones. Message names, field names, field numbers, types and enums all
+  come back.
+* **The tool ships in this repository.**
+  ```powershell
+  python xstudio\tools\xstudio_schema.py schema "D:\NetEase Cloud Music XStudio\NetEase Cloud Music XStudio.exe"
+  python xstudio\tools\xstudio_schema.py read   "…\X Studio3\auto_backup\39971138.svip3"
+  python xstudio\tools\xstudio_schema.py wire   anything.bin
+  ```
+  `read` decodes a real project down to tracks → patterns → notes (lyric, pinyin, pitch)
+  and curves. Full schema and measurements: `xstudio/xstudio-format.md`.
+* **The tick unit is measured at 480 per beat**: each template project's
+  `AudioPattern.real_dur` divided by its own mp3's exact frame count gives 480.00 on
+  seven of the eight templates (the eighth has a trimmed clip). `key_index` is a MIDI
+  note number, `tempo` is BPM × 100, `lyric` is the character and `pronouncing` its
+  pinyin.
+* **The codec ships, in `xstudio/`.** `xstudio/src/Svip3Format.cs` reads and writes the note
+  layer, on a hand-rolled proto3 reader/writer (`xstudio/src/ProtoWire.cs`) — no protobuf
+  dependency, no generated code, and unknown fields are skipped by wire type the way proto3
+  says to. `xstudio`'s own CLI does the conversion:
+
+  ```powershell
+  dotnet build xstudio\cli -c Release
+  xstudio\cli\bin\Release\net8.0\svip3.exe convert song.svip3 song.svp   # notes out
+  xstudio\cli\bin\Release\net8.0\svip3.exe convert song.vpr   song.svip3 # notes in
+  ```
+  What it does **not** carry, because the neutral model has nowhere to put them: the
+  piano-roll parameter curves, per-note vibrato, consonant/SP/silence lengths, per-note tone
+  — and the audio track, so a project written this way arrives without its backing track.
+* **Verified against real material.** All eight template projects the editor installs, all
+  four file versions (3.0.0/3.0.1/3.0.3): 21 singing tracks and 4535 notes, identical in
+  position, length, pitch, lyric and `pronouncing` after a round trip, read back by
+  `xstudio\tools\xstudio_schema.py` — a reader that shares no code with the C# one. Four conventions
+  came out of that, all recorded in `xstudio-format.md`: a rest is a note with `lyric = "-"`;
+  a pattern may start before tick 0 (one project has `real_pos = -1920`); `duration` is a
+  canvas padded past the content, so the codec reproduces the observed envelope rather than
+  deriving a value; and the shipped templates are a macOS zip, so every project is accompanied
+  by a `._name.svip3` AppleDouble sidecar that is not a project at all.
+* **One trap when converting through another editor.** X Studio's `-` rest is Synthesizer V's
+  `-` continuation. In 风雪千千, sending the project out to `.svp` and back turned 14 rests
+  into holds (164 notes in, 150 out). Inside `.svip3`, in and out, nothing changes.
+
+Leads that are still open, in the order worth trying:
+
+0. **First, a lead that is closed, so it is not chased.** The image embeds
+   `fastspeech_singing_v3.proto` (package `WL.Singing`), which looks like a singing engine
+   sitting on this machine. It is not. What is embedded is the **client**: a generated gRPC
+   stub (`…Stub@FastspeechSinging@Singing@WL@@`) and X Studio's own caller
+   (`xstudio::WRSingingHandler::handle`, `xstudio::WRSingingTask::run`), against four methods
+   (`FetchBaseMetadataInput`, `FetchAdditionMetadata`, `FetchWave`, `FetchRapMetadata`), with
+   gRPC and TLS statically linked and the default target in the string table:
+   `xstudio-grpc.music.163.com:443`. Synthesis runs on NetEase's servers, behind a logged-in
+   account (`account_netease_access_token` in `Config\setting.ini`), and the client fetches
+   `base_meta_url` / `addition_meta_url` / `wave_url` back. There is no engine, no model and no
+   local server on the machine (the install is 52 files of Qt/ffmpeg/`SoundTouch.dll`; the
+   109 MB data root is template projects and their mp3s; `SharedRead.exe`/`SharedWrite.exe` are
+   23 KB `SharedMem` helpers, and the image has no named pipes). The endpoint *is*
+   configurable — the app calls it `ServerEnv` (`server_env_grpc_url` in preferences, logged as
+   `ServerEnv saved: preset=%1 http=%2 grpc=%3`) — so a self-hosted `FastspeechSinging` server
+   would be accepted, but not without the model. **This is not an editor-free path to sound;
+   do not spend the session looking for one.**
+1. **`fragment_feature_v3.proto`** — the cached per-fragment features (`oriF0`,
+   `powerCoef`, `specTransCoef`, `apCoef`, `energyValue`, fades, real/fragment times).
+   Find where those blobs are written and that is the render cache.
+2. **`%APPDATA%\XiaoIce\X Studio3\db\xstudio_local.db`** — SQLite (`SQLite format 3\0`), one
+   table `xs_work_info_tb(id, path, duration, singers, modify_time)`, **0 rows** on a machine
+   that has only ever opened templates. It is the app's saved-work index: the row appears when
+   the human saves a project from the UI, and that `path` is the folder worth `watch=`.
+   (`AppConfig.recent_project_list` carries the same idea as `RecentProject.file_path`.)
+3. **`QNrbfFormat.dll`** — NRBF is .NET's BinaryFormatter wire format. It is *not* what
+   `.svip3` uses; something else in this application does. Do not spend the first hour
+   here.
+4. **`NAudio.dll` is x86 while this process is x64**, so it cannot load here. Do not
+   build a plan on it.
+
+And the honest framing for the human: the drop-in proves *we can run code inside X
+Studio*; the recovered schema and `Svip3Format` prove *we can read and write its
+projects*. **Live note control inside the running editor is the thing that still does not
+exist.**
+
+## Step 5 — what you can do meanwhile
+
+Two separate things, and it matters which one you are using.
+
+**X Studio's own command**, which works as cloned and needs nobody's permission:
+
+```powershell
+$svip3 = "xstudio\cli\bin\Release\net8.0\svip3.exe"
+& $svip3 convert song.svip3 song.svp      # notes out: pitch, length, lyric, pinyin, tempo
+& $svip3 convert song.svp   song.svip3    # notes back in, as a project the editor can open
+& $svip3 info  song.svip3
+& $svip3 notes song.svip3
+```
+
+**The toolkit's own command**, which speaks the same formats — `ust`, `ustx`, `vsqx`, `vpr`,
+`ppsf`, `ccs`, `svp`, `midi`, `musicxml`, `lrc`, `srt`, `ass`, `ufdata.json`,
+`commonnote.json`, `vp.json` — plus every job (`swing`, `quantize`, `pinyin`, `harmony`, …):
+
+```powershell
+VocalPatch\dist\cli\vpatch.exe convert song.svp song.ustx
+VocalPatch\dist\cli\vpatch.exe job quantize song.ustx out.ustx --grid 4
+```
+
+`vpatch` does **not** know `.svip3` as cloned — it says "Cannot determine format" — because the
+codec lives in `xstudio/` and nothing registers it (step 3). The MCP server's own project
+tools (`project_create`, `notes_add`, `lyrics_fill`, `export`, `export_midi`, `engines`,
+`open_in`) know four engines and **X Studio is not one of them**. And note what does not
+survive any file path: curves, vibrato and the backing track.
+
+## Step 6 — portability and traps
+
+* The shim has a loader path baked in; on another machine it resolves through
+  `VOCALPATCH_LOADER` → a `vocalpatch.ini` beside the shim → a loader beside the shim →
+  `%LOCALAPPDATA%\VocalPatch\payload\` → `%ProgramData%\VocalPatch\payload\` → the baked
+  path. Set `VOCALPATCH_EDITOR_DIR` when the runtime is not next to the loader.
+* Loader, injector and host bitness must all match. This host is x64.
+* Repackaging while the editor is injected cannot overwrite a mapped payload file; the
+  old one is renamed `<name>.locked-<stamp>` and the new one dropped in.
+* Uninstalling is deleting the `winmm.dll` from the application directory.
+
+## Step 7 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| no `vocalpatch-loader.log` | the shim is not in the application directory, or this build does not import winmm (step 1) |
+| loader log stops before `loader ok` | the payload path is wrong — set `VOCALPATCH_EDITOR_DIR` or put the payload beside the loader |
+| no line in `vocalpatch-editor.log` for this pid | the loader ran, the runtime did not; the loader log says why |
+| hotkeys appear dead | `hotkeydebug=true`, then read the log |
+| an action logs "nothing to do" | as cloned, always: `.svip3` is not in the profile's extension list and the codec is not registered (step 3) |
+| `vpatch` says "Cannot determine format" for an `.svip3` | same cause — use `xstudio`'s `svip3` command, or register the codec (step 3) |
+| `svip3` refuses a file it should read | check the name: `._name.svip3` is an AppleDouble sidecar from the shipped macOS zip, not a project |
+
+Stop at the first unexplained failure and report both logs verbatim. Never restart or
+kill the editor: it is the human's session.
+
+
+==============================================================================
+FILE: 07-openutau-mcp-bridge.txt
+      third-party - Mozilla Public License 2.0, not this repository's own work
+==============================================================================
+
+Install and connect the OpenUtau MCP bridge on this machine.
+
+Facts you need:
+- The bridge is one managed DLL (net10.0, any CPU) published at
+  https://github.com/KakaruHayate/openutau-mcp-bridge/releases
+  Use the newest release (or the exact tag you were given). Assets: the DLL, a .sha256,
+  a build-info.txt, and openutau-mcp-starter.ustx.
+- It exposes an MCP server over loopback HTTP, normally http://127.0.0.1:43102/mcp.
+  The port walks upward when it is taken, so never assume 43102.
+- The endpoint does NOT exist until a voice part is opened in OpenUtau's piano roll.
+  That is the only step that needs the human.
+
+1. Find OpenUtau
+   - Prefer the executable of a running process named OpenUtau.
+   - Otherwise look in the PATH, /Applications, package manager locations, and the
+     Windows install directories.
+   - Decide the data folder:
+       * portable build (OpenUtau.Core.dll sits next to the executable, or a Plugins
+         folder is already there): the folder containing the executable
+       * installed build: Documents/OpenUtau on Windows, ~/Library/OpenUtau on macOS,
+         ${XDG_DATA_HOME:-~/.local/share}/OpenUtau on Linux
+   - The plugin folder is <data folder>/Plugins.
+   Report the executable path, the data folder, whether it looks portable, and the app
+   version before changing anything.
+
+2. Download and verify
+   - Download the DLL and its .sha256 into a temporary directory.
+   - Compare the SHA-256. If it does not match, stop and report; do not install.
+   - Read build-info.txt and keep its version, protocol and baseline for your report.
+   - Do not rebuild the DLL from source: a self-built binary usually targets a different
+     .NET version than the installed application and will not load.
+
+3. Install
+   - If OpenUtau is running, ask the human to save their work and close it. Do not kill
+     the process; unsaved work would be lost.
+   - Create <data folder>/Plugins if it does not exist.
+   - Copy the DLL in, replacing an older copy of OpenUtau.Plugin.McpBridge.dll.
+   - Leave any OpenUtau.Plugin.McpBridge.*.txt or .json files alone; they are diagnostics.
+
+4. Bring it up
+   - If OpenUtau is not running, start it with the starter project from the release
+     (openutau-mcp-starter.ustx). That file has a single part, so there is something to
+     open:
+       OpenUtau.exe "/absolute/path/openutau-mcp-starter.ustx"
+   - If the human already has a project open, do not replace it; ask them to open one of
+     their own parts instead.
+   - Ask the human, in one sentence: "double-click the part so the piano roll opens".
+   - Then wait up to 120 seconds, checking every 2 seconds:
+       * if <Plugins>/OpenUtau.Plugin.McpBridge.boot.txt exists, its last line names the
+         real endpoint
+       * otherwise POST a tools/list JSON-RPC request to http://127.0.0.1:PORT/mcp for
+         PORT in 43102..43111
+   - Success means a JSON-RPC result containing a tool list. Record the port and count.
+
+5. Connect
+   - If you can register an HTTP MCP server in your own configuration without restarting
+     yourself, add http://127.0.0.1:<port>/mcp and continue.
+   - Otherwise print the exact command for the human, for example:
+       codex mcp add openutau --url http://127.0.0.1:<port>/mcp
+       claude mcp add --transport http openutau http://127.0.0.1:<port>/mcp
+     and stop after printing it.
+   - Once the server is visible to you, call openutau_status.
+       * compatibility.ok false: quote compatibility.reasons and stop.
+       * compatibility.ok true: tell the human the app version, the tool count and the
+         current project revision, then stop. Do not edit the project.
+
+6. Report
+   Print a short block with: executable path, plugin path, bridge version and protocol,
+   endpoint, tool count, compatibility level, and the project path and revision if one is
+   open. If something failed, also include the last 20 lines of boot.txt, the errors array
+   from OpenUtau.Plugin.McpBridge.status.json, and the tail of OpenUtau's log folder.
+
+Rules:
+- Never modify or save the user's project.
+- Do not install anything else: no packages, no runtimes, no voicebanks.
+- If a step fails, stop at that step and report, rather than trying alternatives.

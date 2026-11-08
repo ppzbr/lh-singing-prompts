@@ -1,0 +1,27 @@
+# sha256 of every file in this repository
+# MANIFEST.txt itself is not listed.  Regenerate with:
+#   python tools/make-manifest.py
+# Verify by hand with:
+#   python tools/make-manifest.py --check
+a46c56baa0624a752aad41c298e6ff2b801a518691649a53325b1c27c14875a1  .gitattributes
+865a3a19eab8966f624295d25d29dda950e70d58aaed2c3520d2cb51c69e4b34  .gitignore
+fb093f4a47af908e44ab2c099861fb69b82bb0b294d9715ffda6378232c751a9  LICENSE
+3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04  LICENSE-MPL-2.0.txt
+44e405c93e78ec8b12390ab3a9df327909c6ca23742c87109f4907a219288997  NOTICE.md
+e21ddcdd9c6914e1f1e35d5c3b05d7196ca88104c69523fc817da9053d2006fd  README.md
+1fc393a08f2fa8e1e15b3ad50902f180cba35162d8bc8349726f39e930804c9c  prompts/01-synthesizer-v.md
+ced16710d602125f1ad49f84dfac256fde96bde1b106b9e6b2625e79ba2a40ee  prompts/01-synthesizer-v.txt
+6cab10dcc8674f3f3aaa2d80a7228ad989fb49bcf21cc6e64b453dd288868320  prompts/02-cevio-ai.md
+4803c6e4ef19a957e60d87bd9b7638307847dc558ff2529619115147ae73e147  prompts/02-cevio-ai.txt
+c2b713009b997cee5c03e07d108a1d9df730e245d6c7f08c626f18ca132e4e6f  prompts/03-voisona.md
+a7ad83e18f23150588af6820ba9c4363f304f48e16492ce7704e9e4a36f4fe60  prompts/03-voisona.txt
+0d7cd518a610e3454cb78fa8fd34cf65a9825b5e1b6f490f3cca789df416ca80  prompts/04-vocaloid6.md
+0a0c53d02dba1961351c78989bbc3ecf6dd00137eec7b031731c9a56fa045858  prompts/04-vocaloid6.txt
+50732debfe42311c382bc2bea54821ed96527cf3c406cb1556f72a0963c688fb  prompts/05-piapro-studio-nt.md
+ba12ed70187a04f6b8b15a2945b889ea8c9f6ed3c5b91c62cbdc1d73f89e95a0  prompts/05-piapro-studio-nt.txt
+de0d64ea347bdd992e1d54c653f6cfe3a48e6b9fa2c969df564277a66f9bff36  prompts/06-x-studio.md
+db2d624524d5146a43b8880598240cdf3ce770c71d5147268f618ab56b093f7b  prompts/06-x-studio.txt
+fd2fb19d8010bd02385b5a732021604f3cef6729915415b16fef910ded984ffa  prompts/07-openutau-mcp-bridge.txt
+744b919520395b3ae0adf5d0a8204a9adb3b97f5744cc9ede9fa17a9fd65fa83  prompts/all-prompts.txt
+e8ad198207cd87aeb4cb4f026b738f72a90832a924a09bb4ff5a2defebde0066  tests/test_repo.py
+79ed51c18a4100d04ac4cef90dd08b5ea85dd93acab5196202b844c7cbff2cb1  tools/make-manifest.py

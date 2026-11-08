@@ -1,0 +1,4 @@
+# the repository's own integrity tool and its tests
+__pycache__/
+*.py[cod]
+.pytest_cache/

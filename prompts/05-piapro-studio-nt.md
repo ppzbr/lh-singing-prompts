@@ -1,0 +1,249 @@
+# Piapro Studio NT — install the in-process runtime, and drive the project file
+
+> Paste everything below the rule into an agent that has shell access to the Windows
+> machine running Piapro Studio NT. It is written to stand alone.
+
+---
+
+## What actually exists for this editor — read before promising anything
+
+Piapro Studio NT has **no vendor scripting API and no plugin API**, and this repository
+has **no MCP bridge** for it. Do not tell the human you are installing one.
+
+What does exist, and is what this prompt installs:
+
+| channel | what it gives you | state |
+|---|---|---|
+| **project file** — `.ppsf` | read and write the project, batch edit jobs, lyric romanisation, conversion to and from a dozen other editors' formats | built, round-trip tested |
+| **injected runtime** — a one-file drop-in shim | the eleven edit actions bound to hotkeys **inside** the running editor, plus autosave | built; same mechanism proven on six other editors |
+
+So: an AI can do everything to a Piapro project **as a file**, and can put a hotkey-bound
+action set **inside** Piapro. What it cannot do is edit the notes of the open project
+live, because nothing has been written that reaches Piapro's in-memory note model. Say
+that plainly rather than implying otherwise.
+
+Two measured facts that make the drop-in work here:
+
+* `Piapro Studio NT.exe` (x64, in `Standalone\`) **statically imports `WINMM.dll`** —
+  verified with a PE import walk, not assumed. `winmm` is not in the KnownDLLs list, so
+  Windows resolves that import from the **application directory first**: the shim placed
+  beside the exe is what gets loaded.
+* The engine, `Common\PPS3.dll` (65.6 MB), imports `WINMM.dll` too, and the exe links
+  `mscoree.dll` — it boots the .NET Framework CLR itself. That is why the CLR-hosting
+  loader is the right shape here, and the `hostfxr` shape is not needed.
+
+## Rules
+
+1. The only thing written outside this repository is one `winmm.dll` placed in the
+   editor's application directory. Delete it to uninstall. Nothing else, ever.
+2. Never modify, replace or delete a Piapro file. Never touch `PPS3.dll` or the data
+   folders (`Common\Data\plugins`, `settings`, `packages`, `phrases`).
+3. Never kill the editor process, and never let an action run against a project the
+   human has unsaved work in without them knowing.
+4. Every in-place action keeps a `.bak`; an action that changes nothing must not write.
+   Do not bypass that.
+5. If a step fails, stop at that step and report exactly what happened.
+6. Work only inside this repository. Nothing else on the machine is yours to change.
+
+## Step 0 — the repository and what to install
+
+```powershell
+git clone https://github.com/ppzbr/lh-piapro
+cd lh-piapro
+```
+
+Required: the **.NET SDK (8 or 10)**, and one C compiler for the native loader — `zig`
+(`python -m pip install ziglang`), MSVC, mingw-w64 or TinyCC; `build_loader.ps1`
+autodetects one. Nothing else.
+
+```powershell
+dotnet build VocalPatch\VocalPatch.slnx -c Release
+```
+
+## Step 1 — build the payload, the loader and the drop-in
+
+```powershell
+# the loader; also builds and loads a throwaway host to prove it works with no
+# editor involved, then drops the 64-bit loader into the payload folder
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\build_loader.ps1 -TestHost `
+    -Payload (Resolve-Path VocalPatch\src\VocalPatch.Editor\bin\Release\net472)
+
+# everything a user needs -> VocalPatch\dist\
+powershell -ExecutionPolicy Bypass -File VocalPatch\package.ps1
+```
+
+`VocalPatch\src\VocalPatch.Editor\bin\Release\net472\` is the complete, self-contained
+payload (`VocalPatch.Editor.dll`, `VocalPatch.Core.dll`, `0Harmony.dll`, `YamlDotNet.dll`,
+`System.Text.Json.dll` and its shims): that folder is exactly what the loader needs.
+`dist\` collects the loader (x64 and x86), the injector, the CLI, the payload and the
+drop-in shims.
+
+Do not skip `-TestHost`. It is the only step that proves the loader works **before** an
+editor is involved, and the loader appends every step to `%TEMP%\vocalpatch-loader.log`
+— read that log rather than guessing.
+
+## Step 2 — drive a project file (works with no editor at all)
+
+The CLI is `VocalPatch\dist\cli\vpatch.exe`:
+
+```powershell
+vpatch convert song.ustx song.ppsf        # -> Piapro's own format
+vpatch convert song.ppsf  song.vpr        # Piapro <-> VOCALOID4
+vpatch jobs                               # the job set
+
+vpatch job swing     song.ppsf out.ppsf --division 8 --amount 55
+vpatch job quantize  song.ppsf out.ppsf --grid 4 --strength 80
+vpatch pinyin song.ppsf song.pinyin.ppsf --split --tones marks
+vpatch harmony song.ppsf out.ppsf --interval thirdUp --root C --scale major
+vpatch autosave song.ppsf --interval 120 --snapshot
+```
+
+Formats that read and write: `ust`, `ustx`, `vsqx`, `vpr`, **`ppsf`**, `ccs`, `svp`,
+`midi`, `ufdata.json`, `commonnote.json`, `musicxml`, `lrc`, `srt`, `ass`,
+`vp.json`. So a song built anywhere can be handed to Piapro, and a Piapro project can be
+read, edited and sent anywhere else.
+
+`.ppsf` is VOCALOID4 XML — the same schema family as `.vsqx` and `.vpr`. Keep that in
+mind: Piapro is the only one of the editors in this repository whose project format is
+also a widely used interchange format.
+
+## Step 3 — the drop-in, so the actions exist inside the running editor
+
+Copy one file into the application directory:
+
+```powershell
+# C:\Program Files\... needs an elevated shell
+Copy-Item VocalPatch\dist\dropin\winmm.dll "C:\Program Files\Crypton\Piapro Studio NT\Standalone\"
+```
+
+`VocalPatch\native\deploy_dropin.ps1` can do it for you, but **its target table has the
+paths of the machine this was developed on hard-coded**. Use it to report
+(`-Apply` / `-Apply -Remove` to install/uninstall) only after checking the row for
+Piapro points at this machine's install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\deploy_dropin.ps1            # report only
+powershell -ExecutionPolicy Bypass -File VocalPatch\native\deploy_dropin.ps1 -Apply
+```
+
+The shim does exactly one thing: `DllMain` starts a thread that loads
+`vocalpatch_loader.dll`, and **all 180 `winmm` exports are forwarded** to
+`System32\winmm.dll` so the editor's own audio behaviour cannot change. That forwarding
+is the reason a broken drop-in is the only thing that can be noticed, and it is why the
+shim is safe to leave in place.
+
+**Verify before trusting it:**
+
+```powershell
+# does this exe actually import winmm? (the drop-in is inert if it does not)
+powershell -ExecutionPolicy Bypass -File VocalPatch\dist\dropin\pe-imports.ps1 `
+    -Path "C:\Program Files\Crypton\Piapro Studio NT\Standalone\Piapro Studio NT.exe" -NamesOnly -Only WINMM.dll
+```
+
+Then start Piapro and read the two logs:
+
+```powershell
+Get-Content "$env:TEMP\vocalpatch-loader.log" -Tail 5     # last line must be: loader ok
+Get-Content "$env:TEMP\vocalpatch-editor.log" -Tail 20    # profile, watching, hotkey lines
+```
+
+Expected in the second log:
+
+```
+profile: Piapro Studio
+watching N folder(s)
+patched N save method(s)
+hotkey: Ctrl+Alt+V, Ctrl+Alt+S, Ctrl+Alt+Q, Ctrl+Alt+C, Ctrl+Alt+T, Ctrl+Alt+N,
+        Ctrl+Alt+P, Ctrl+Alt+H, Ctrl+Alt+L, Ctrl+Alt+E, Ctrl+Alt+Z
+```
+
+Read the `note:` line if it appears. On the development machine it read *"this host's
+own code is not in this AppDomain … the save hook cannot see its saves; the folder
+watcher and the hotkeys still work"* — so **do not promise that saving in Piapro
+triggers a snapshot.** The folder watcher and the hotkeys work regardless; the save
+hook depends on whether the host's own code shares the runtime this loader starts, and
+the log states which case you are in.
+
+The eleven actions, one hotkey each:
+
+| key | action |
+|---|---|
+| `Ctrl+Alt+V` | snapshot (timestamped copy into `.vocalpatch-autosave\`) |
+| `Ctrl+Alt+S` | swing |
+| `Ctrl+Alt+Q` | quantize |
+| `Ctrl+Alt+C` | staccato |
+| `Ctrl+Alt+T` | transpose |
+| `Ctrl+Alt+N` | normalize |
+| `Ctrl+Alt+P` | pinyin (romanise lyrics, keeping a `.bak`) |
+| `Ctrl+Alt+H` | harmony |
+| `Ctrl+Alt+L` | lyrics — **reads the clipboard**, one syllable per line: a hotkey cannot take typed input |
+| `Ctrl+Alt+E` | export every format into `vocalpatch-export\` |
+| `Ctrl+Alt+Z` | restore the `.bak` |
+
+Settings live in `vpatch-editor.ini` beside the payload: `profile=`, `autosave=`,
+`patchsaves=`, `snapshotinterval=`, `watch=<dir>` (several separated by `;`),
+`hotkey.<action>=`, `hotkeydebug=true`. Set `hotkeydebug=true` when a hotkey seems
+dead: a dead hook and a working one with nothing to do are otherwise
+indistinguishable. A chord acts only when the foreground window belongs to the injected
+process, and only then is it swallowed — with several editors injected, the others log
+`ignored (not the foreground editor)` and pass it on.
+
+**Watched folders** come from the profile
+(`{Documents}\Piapro Studio`, `{Documents}\VOCALOID4`) plus any `watch=` entries. If
+those directories do not exist, the user's Documents folder is used instead, so autosave
+still has somewhere to look — but it is looking in the wrong place. Projects living
+elsewhere need `watch=<dir>`.
+
+## Step 4 — the same actions on a file, no injection
+
+```powershell
+VocalPatch\dist\injector\vpatch-inject.exe actions
+VocalPatch\dist\injector\vpatch-inject.exe action song.ppsf swing
+VocalPatch\dist\injector\vpatch-inject.exe action song.ppsf export
+VocalPatch\dist\injector\vpatch-inject.exe autosave song.ppsf --interval 300
+```
+
+The CLI's `VocalPatch.Editor.EditorActions` and the runtime's hotkeys are the same entry
+point, so a hotkey press and a command line do exactly the same thing. Prefer this route
+when you do not need the editor open: it cannot disturb anybody's session.
+
+## Step 5 — what does not exist, and what to measure if you want it
+
+* **No live note editing.** Nothing reaches Piapro's in-memory note model. A hotkey
+  edits the project **file**. If the human asks you to add a note to the open project
+  without touching the file, the honest answer is no.
+* **No MCP bridge for Piapro.** The port has not been attempted, and nothing in this
+  repository implements one, so do not describe one.
+* **The vector for such a bridge is proven, though**: the drop-in loader already runs
+  managed code inside Piapro, and the payload is where a bridge would live. If the human
+  wants that built, say what is missing (a bridge assembly like the CeVIO one, plus the
+  endpoint) rather than inventing it.
+
+## Step 6 — portability, and the traps
+
+* The shim has a loader path baked in. On another machine it resolves in this order:
+  `VOCALPATCH_LOADER` environment variable → `loader=<path>` in a `vocalpatch.ini` beside
+  the shim → a `vocalpatch_loader.dll` beside the shim →
+  `%LOCALAPPDATA%\VocalPatch\payload\vocalpatch_loader.dll` →
+  `%ProgramData%\VocalPatch\payload\vocalpatch_loader.dll` → the baked path. Set
+  `VOCALPATCH_EDITOR_DIR` (where the runtime lives) too when the payload is not next to
+  the loader.
+* Loader and host bitness must match exactly, and so must the injector. This host is x64.
+* Repackaging while an editor is injected cannot overwrite a payload file that is mapped
+  into the running process: the old file is renamed `<name>.locked-<stamp>` and the new
+  one dropped in. Those leftovers can be deleted once the editor exits.
+* Writing into `C:\Program Files` needs an elevated shell. If you do not have one, stop
+  and ask the human — do not look for a way around it.
+
+## Step 7 — when it goes wrong
+
+| symptom | cause |
+|---|---|
+| no `vocalpatch-loader.log` at all | the editor never loaded the shim: check the PE import check in step 3, and that the file is in the **application** directory (beside the exe, not in `Common\`) |
+| loader log stops before `loader ok` | the payload path is wrong — set `VOCALPATCH_EDITOR_DIR`, or copy the payload next to the loader |
+| `%TEMP%\vocalpatch-editor.log` has no line for this pid | the loader ran but the runtime did not start; the loader log says why |
+| hotkeys do nothing | set `hotkeydebug=true` and try again — then read the log instead of guessing |
+| an action logs "nothing to do" | its input produced no change, and the runtime deliberately refuses to write in that case |
+
+Stop at the first unexplained failure and report the two logs verbatim. Never restart or
+kill an editor holding unsaved work.
